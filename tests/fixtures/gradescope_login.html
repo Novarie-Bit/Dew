@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html><head><meta name="csrf-token" content="meta-token"></head>
+<body>
+<form class="loginForm" action="/login" accept-charset="UTF-8" method="post">
+  <input name="utf8" type="hidden" value="&#x2713;" />
+  <input type="hidden" name="authenticity_token" value="tok3n==" />
+  <input class="form--input" type="email" name="session[email]" id="session_email" />
+  <input class="form--input" type="password" name="session[password]" id="session_password" />
+  <input type="hidden" name="session[remember_me]" value="0" />
+  <input type="checkbox" value="1" name="session[remember_me]" id="session_remember_me" />
+  <input type="submit" name="commit" value="Log In" class="tiiBtn tiiBtn-primary" />
+</form>
+</body></html>

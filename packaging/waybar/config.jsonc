@@ -1,0 +1,9 @@
+// Add "custom/dew" to modules-left/center/right, then paste this block.
+"custom/dew": {
+  "exec": "dew waybar",
+  "return-type": "json",
+  "interval": 300,
+  "format": "󰃭 {}",
+  "on-click": "kitty -e dew",   // or: alacritty -e dew, foot dew, konsole -e dew
+  "tooltip": true
+}

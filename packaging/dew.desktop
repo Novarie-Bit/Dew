@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Dew
+GenericName=Assignment Tracker
+Comment=Canvas and Gradescope assignments in one list
+Exec=dew
+Terminal=true
+Icon=x-office-calendar
+Categories=Education;Utility;ConsoleOnly;
+Keywords=canvas;gradescope;homework;assignments;school;
