@@ -1,6 +1,7 @@
-# Builds the surrounding checkout:  cd packaging/arch && makepkg -si
+# Builds the surrounding checkout:  cd packaging/arch && makepkg -sif
+# (-f rebuilds even if pkgver is unchanged, so updates from git pull get built)
 pkgname=dew
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Assignment tracker for Canvas and Gradescope (desktop app + TUI)"
 arch=('x86_64' 'aarch64')

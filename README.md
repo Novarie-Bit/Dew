@@ -19,8 +19,12 @@ to open it in your browser.
 ```sh
 sudo pacman -S --needed cmake webkit2gtk-4.1
 git clone https://github.com/novarie-bit/dew && cd dew/packaging/arch
-makepkg -si
+makepkg -sif
 ```
+
+To update later: `cd ~/dew && git pull && cd packaging/arch && makepkg -sif`. The `-f`
+makes makepkg rebuild even when the version number hasn't changed. Without it, makepkg
+may reinstall the package it built last time.
 
 You also need Rust. If `cargo --version` doesn't work yet, install **either**
 `rustup` (then run `rustup toolchain install stable`) **or** the `rust` package. Don't

@@ -1,6 +1,6 @@
 [package]
 name = "dew"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Assignment tracker for Canvas and Gradescope"
 repository = "https://github.com/novarie-bit/dew"
