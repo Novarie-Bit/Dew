@@ -1,27 +1,22 @@
 //! Gradescope has no public API, so this logs in with the regular web form
 //! and scrapes the course pages.
 
-use std::fs;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::Url;
 use reqwest::blocking::Client;
-use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
 use scraper::{ElementRef, Html, Selector};
 
-use crate::config::write_file;
+use crate::jar::{self, Jar, NewCookie};
 use crate::model::{Assignment, Source, Status};
 
 pub const BASE: &str = "https://www.gradescope.com";
 
 pub struct Gradescope {
     http: Client,
-    jar: Arc<CookieStoreMutex>,
-    cookie_path: PathBuf,
+    jar: Jar,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,47 +42,23 @@ fn text_of(el: ElementRef<'_>) -> String {
 impl Gradescope {
     /// Creates a client, restoring any saved session cookies.
     pub fn load(cookie_path: &Path) -> Result<Self> {
-        let store = match fs::File::open(cookie_path) {
-            Ok(f) => cookie_store::serde::json::load_all(BufReader::new(f))
-                .map_err(|e| anyhow!("reading {}: {e}", cookie_path.display()))?,
-            Err(_) => CookieStore::new(),
-        };
-        let jar = Arc::new(CookieStoreMutex::new(store));
-        let http = crate::http_client().cookie_provider(jar.clone()).build()?;
-        Ok(Gradescope {
-            http,
-            jar,
-            cookie_path: cookie_path.to_path_buf(),
-        })
+        let jar = Jar::load(cookie_path)?;
+        let http = crate::http_client()
+            .cookie_provider(jar.provider())
+            .build()?;
+        Ok(Gradescope { http, jar })
     }
 
     pub fn has_session(&self) -> bool {
-        self.jar
-            .lock()
-            .map(|s| s.iter_unexpired().next().is_some())
-            .unwrap_or(false)
+        self.jar.has_any()
     }
 
     pub fn save(&self) -> Result<()> {
-        let store = self
-            .jar
-            .lock()
-            .map_err(|_| anyhow!("cookie jar poisoned"))?;
-        let mut buf = Vec::new();
-        cookie_store::serde::json::save_incl_expired_and_nonpersistent(&store, &mut buf)
-            .map_err(|e| anyhow!("serializing cookies: {e}"))?;
-        write_file(&self.cookie_path, &String::from_utf8(buf)?, 0o600)
+        self.jar.save()
     }
 
     pub fn clear(&self) -> Result<()> {
-        self.jar
-            .lock()
-            .map_err(|_| anyhow!("cookie jar poisoned"))?
-            .clear();
-        match fs::remove_file(&self.cookie_path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
-        }
+        self.jar.clear()
     }
 
     fn get_html(&self, path: &str) -> Result<(Url, String)> {
@@ -105,10 +76,7 @@ impl Gradescope {
 
     /// Email/password login (the "Log In" form, not school SSO).
     pub fn login(&self, email: &str, password: &str) -> Result<()> {
-        self.jar
-            .lock()
-            .map_err(|_| anyhow!("cookie jar poisoned"))?
-            .clear();
+        self.jar.clear_memory()?;
         let (_, page) = self.get_html("/login")?;
         let token = parse_authenticity_token(&page)
             .context("couldn't find the login form on gradescope.com/login")?;
@@ -141,41 +109,24 @@ impl Gradescope {
     /// Imports a browser session from a `Cookie:` header style string, e.g.
     /// `signed_token=...; _gradescope_session=...`.
     pub fn import_cookies(&self, header: &str) -> Result<()> {
-        self.insert_cookies(header)?;
-        if !self.check_session()? {
-            bail!("Gradescope didn't accept those cookies (session expired or incomplete)");
-        }
-        self.save()
-    }
-
-    fn insert_cookies(&self, header: &str) -> Result<()> {
-        let url: Url = BASE.parse()?;
-        let mut store = self
-            .jar
-            .lock()
-            .map_err(|_| anyhow!("cookie jar poisoned"))?;
-        store.clear();
-        let mut n = 0;
-        for pair in header.trim().trim_start_matches("Cookie:").split(';') {
-            let pair = pair.trim();
-            if pair.is_empty() || !pair.contains('=') {
-                continue;
-            }
-            // A far-future expiry makes the cookie persistent so it's saved.
-            let cookie = format!(
-                "{pair}; Domain=gradescope.com; Path=/; Secure; Expires=Fri, 31 Dec 2100 23:59:59 GMT"
-            );
-            store
-                .parse(&cookie, &url)
-                .map_err(|e| anyhow!("bad cookie {pair:?}: {e}"))?;
-            n += 1;
-        }
-        if n == 0 {
+        let cookies = jar::parse_header(header, "gradescope.com");
+        if cookies.is_empty() {
             bail!(
                 "no cookies found; expected something like signed_token=...; _gradescope_session=..."
             );
         }
-        Ok(())
+        self.use_cookies(&cookies)
+    }
+
+    /// Replaces the session with `cookies`, keeping them only if Gradescope
+    /// accepts them.
+    pub fn use_cookies(&self, cookies: &[NewCookie]) -> Result<()> {
+        self.jar.replace(&BASE.parse()?, cookies)?;
+        if !self.check_session()? {
+            self.jar.clear_memory()?;
+            bail!("Gradescope didn't accept that session (expired or incomplete)");
+        }
+        self.save()
     }
 
     pub fn check_session(&self) -> Result<bool> {
@@ -516,20 +467,24 @@ mod tests {
     }
 
     #[test]
-    fn cookie_import_round_trips() {
+    fn cookie_jar_round_trips() {
         let dir = std::env::temp_dir().join(format!("dew-test-{}", std::process::id()));
         let path = dir.join("cookies.json");
         let gs = Gradescope::load(&path).unwrap();
         assert!(!gs.has_session());
-        assert!(gs.insert_cookies("  ; ").is_err());
-        gs.insert_cookies("Cookie: signed_token=abc%3D%3D; _gradescope_session=xyz")
-            .unwrap();
+        assert!(jar::parse_header("  ; ", "gradescope.com").is_empty());
+        let cookies = jar::parse_header(
+            "Cookie: signed_token=abc%3D%3D; _gradescope_session=xyz",
+            "gradescope.com",
+        );
+        gs.jar.replace(&BASE.parse().unwrap(), &cookies).unwrap();
         gs.save().unwrap();
 
         let reloaded = Gradescope::load(&path).unwrap();
         assert!(reloaded.has_session());
         let url: Url = "https://www.gradescope.com/account".parse().unwrap();
-        let store = reloaded.jar.lock().unwrap();
+        let provider = reloaded.jar.provider();
+        let store = provider.lock().unwrap();
         let mut sent: Vec<_> = store.get_request_values(&url).collect();
         sent.sort();
         assert_eq!(

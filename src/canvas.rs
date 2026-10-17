@@ -6,11 +6,14 @@ use reqwest::header::{AUTHORIZATION, LINK};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::config::{CanvasCreds, Paths};
+use crate::jar::Jar;
 use crate::model::{Assignment, Source, Status};
 
 pub struct Canvas {
     base: String,
-    token: String,
+    /// None means a browser session from the cookie jar.
+    token: Option<String>,
     http: Client,
 }
 
@@ -61,28 +64,61 @@ pub fn normalize_url(url: &str) -> String {
     }
 }
 
+/// Session-authenticated API responses start with this anti-JSON-hijacking prefix.
+const JSON_PREFIX: &str = "while(1);";
+
+fn decode<T: DeserializeOwned>(resp: Response, what: &str) -> Result<T> {
+    let body = resp.text().with_context(|| format!("reading {what}"))?;
+    let body = body.trim_start();
+    let body = body.strip_prefix(JSON_PREFIX).unwrap_or(body);
+    serde_json::from_str(body).with_context(|| format!("decoding {what}"))
+}
+
 impl Canvas {
+    /// Authenticates with a personal access token.
     pub fn new(base: &str, token: &str) -> Result<Self> {
         let http = crate::http_client().build()?;
         Ok(Canvas {
             base: normalize_url(base),
-            token: token.trim().to_string(),
+            token: Some(token.trim().to_string()),
             http,
         })
     }
 
+    /// Authenticates with browser session cookies.
+    pub fn with_session(base: &str, jar: &Jar) -> Result<Self> {
+        let http = crate::http_client()
+            .cookie_provider(jar.provider())
+            .build()?;
+        Ok(Canvas {
+            base: normalize_url(base),
+            token: None,
+            http,
+        })
+    }
+
+    pub fn from_creds(creds: &CanvasCreds, paths: &Paths) -> Result<Self> {
+        if creds.token.trim().is_empty() {
+            Canvas::with_session(&creds.url, &Jar::load(&paths.canvas_cookies)?)
+        } else {
+            Canvas::new(&creds.url, &creds.token)
+        }
+    }
+
     fn get(&self, url: &str) -> Result<Response> {
-        let resp = self
-            .http
-            .get(url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
+        let mut req = self.http.get(url);
+        if let Some(token) = &self.token {
+            req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let resp = req
             .send()
             .map_err(|e| crate::network_error(e, &self.base))?;
         match resp.status() {
             s if s.is_success() => Ok(resp),
-            StatusCode::UNAUTHORIZED => {
+            StatusCode::UNAUTHORIZED if self.token.is_some() => {
                 bail!("the access token was rejected (401); create a new one and sign in again")
             }
+            StatusCode::UNAUTHORIZED => bail!("your Canvas session expired; sign in again"),
             s => bail!("Canvas returned {s} for {url}"),
         }
     }
@@ -98,18 +134,18 @@ impl Canvas {
                 .get(LINK)
                 .and_then(|v| v.to_str().ok())
                 .and_then(next_link);
-            let page: Vec<T> = resp.json().with_context(|| format!("decoding {url}"))?;
+            let page: Vec<T> = decode(resp, &url)?;
             out.extend(page);
         }
         Ok(out)
     }
 
-    /// Verifies the token and returns the user's display name.
+    /// Verifies the credentials and returns the user's display name.
     pub fn whoami(&self) -> Result<String> {
-        let user: User = self
-            .get(&format!("{}/api/v1/users/self", self.base))?
-            .json()
-            .context("decoding Canvas user")?;
+        let user: User = decode(
+            self.get(&format!("{}/api/v1/users/self", self.base))?,
+            "Canvas user",
+        )?;
         Ok(user.name)
     }
 
@@ -245,6 +281,16 @@ mod tests {
             Some("https://c.edu/api/v1/courses?page=2&per_page=100")
         );
         assert_eq!(next_link(r#"<https://x>; rel="last""#), None);
+    }
+
+    #[test]
+    fn strips_session_json_prefix() {
+        let decode_str = |body: &str| -> serde_json::Value {
+            let body = body.trim_start();
+            serde_json::from_str(body.strip_prefix(JSON_PREFIX).unwrap_or(body)).unwrap()
+        };
+        assert_eq!(decode_str(r#"while(1);{"name":"A"}"#)["name"], "A");
+        assert_eq!(decode_str(r#"{"name":"B"}"#)["name"], "B");
     }
 
     #[test]

@@ -1,8 +1,11 @@
 mod auth;
+mod browser_login;
 mod canvas;
 mod config;
 mod gradescope;
 mod gui;
+mod hidden;
+mod jar;
 mod model;
 mod sync;
 mod tui;
@@ -33,7 +36,7 @@ enum Command {
     Tui,
     /// Fetch everything and print what's due.
     List {
-        /// Include finished and long-past items.
+        /// Include finished, long-past, and hidden items.
         #[arg(short, long)]
         all: bool,
         /// Print JSON instead of a table.
@@ -48,14 +51,30 @@ enum Command {
     /// JSON for a Waybar custom module.
     Waybar,
     /// Sign in to a service.
+    ///
+    /// By default this opens a sign-in window where you log in normally
+    /// (school SSO, Duo, ...).
     Login {
         service: Service,
         /// Canvas base URL.
         #[arg(long, default_value = DEFAULT_CANVAS_URL)]
         url: String,
-        /// Gradescope: paste browser cookies instead of using a password (for SSO accounts).
-        #[arg(long)]
+        /// Paste cookies copied from a signed-in browser instead.
+        #[arg(long, conflicts_with_all = ["token", "password"])]
         cookies: bool,
+        /// Canvas: use a personal access token instead.
+        #[arg(long, conflicts_with = "password")]
+        token: bool,
+        /// Gradescope: use an email and password instead.
+        #[arg(long)]
+        password: bool,
+    },
+    /// The sign-in window itself (used internally).
+    #[command(hide = true)]
+    BrowserLogin {
+        service: Service,
+        #[arg(long, default_value = DEFAULT_CANVAS_URL)]
+        url: String,
     },
     /// Forget saved credentials.
     Logout { service: Option<Service> },
@@ -98,7 +117,28 @@ fn main() -> Result<()> {
             service,
             url,
             cookies,
-        } => login(&paths, service, &url, cookies),
+            token,
+            password,
+        } => {
+            let method = match (cookies, token, password) {
+                (true, ..) => Method::Cookies,
+                (_, true, _) => Method::Token,
+                (.., true) => Method::Password,
+                _ => Method::Browser,
+            };
+            login(&paths, service, &url, method)
+        }
+        Command::BrowserLogin { service, url } => {
+            let site = match service {
+                Service::Canvas => browser_login::Site::Canvas { url },
+                Service::Gradescope => browser_login::Site::Gradescope,
+            };
+            if let Err(e) = browser_login::run_window(paths, site) {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::Logout { service } => {
             if matches!(service, None | Some(Service::Canvas)) {
                 auth::logout_canvas(&paths)?;
@@ -159,16 +199,34 @@ fn prompt(label: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-fn login(paths: &Paths, service: Service, url: &str, cookies: bool) -> Result<()> {
-    match service {
-        Service::Canvas => {
-            let url = canvas::normalize_url(url);
-            println!("Create a token at {url}/profile/settings -> \"+ New Access Token\".");
-            let token = rpassword::prompt_password("Canvas access token: ")?;
-            let user = auth::login_canvas(paths, &url, &token)?;
-            println!("Signed in to Canvas as {user}");
+enum Method {
+    Browser,
+    Cookies,
+    Token,
+    Password,
+}
+
+fn login(paths: &Paths, service: Service, url: &str, method: Method) -> Result<()> {
+    let url = canvas::normalize_url(url);
+    let message = match (service, method) {
+        (Service::Canvas, Method::Browser) => {
+            println!("Sign in to Canvas in the window that opens…");
+            browser_login::sign_in(&browser_login::Site::Canvas { url })?
         }
-        Service::Gradescope if cookies => {
+        (Service::Gradescope, Method::Browser) => {
+            println!("Sign in to Gradescope in the window that opens…");
+            browser_login::sign_in(&browser_login::Site::Gradescope)?
+        }
+        (Service::Canvas, Method::Cookies) => {
+            println!(
+                "In a browser signed in to Canvas, open DevTools -> Storage/Application -> \
+                 Cookies and copy canvas_session."
+            );
+            let c = rpassword::prompt_password("Cookies (canvas_session=...): ")?;
+            let user = auth::login_canvas_cookies(paths, &url, &c)?;
+            format!("Signed in to Canvas as {user}")
+        }
+        (Service::Gradescope, Method::Cookies) => {
             println!(
                 "In a browser signed in to gradescope.com, open DevTools -> Storage/Application -> \
                  Cookies and copy signed_token and _gradescope_session."
@@ -177,15 +235,22 @@ fn login(paths: &Paths, service: Service, url: &str, cookies: bool) -> Result<()
                 "Cookies (signed_token=...; _gradescope_session=...): ",
             )?;
             auth::login_gradescope_cookies(paths, &c)?;
-            println!("Signed in to Gradescope");
+            "Signed in to Gradescope".into()
         }
-        Service::Gradescope => {
+        (Service::Canvas, _) => {
+            println!("Create a token at {url}/profile/settings -> \"+ New Access Token\".");
+            let token = rpassword::prompt_password("Canvas access token: ")?;
+            let user = auth::login_canvas(paths, &url, &token)?;
+            format!("Signed in to Canvas as {user}")
+        }
+        (Service::Gradescope, _) => {
             let email = prompt("Gradescope email: ")?;
             let password = rpassword::prompt_password("Gradescope password: ")?;
             auth::login_gradescope(paths, &email, &password)?;
-            println!("Signed in to Gradescope as {email}");
+            format!("Signed in to Gradescope as {email}")
         }
-    }
+    };
+    println!("{message}");
     Ok(())
 }
 
@@ -230,12 +295,17 @@ fn load_or_sync(cfg: &Config, paths: &Paths, cached: bool) -> Result<Cache> {
     Ok(report.cache)
 }
 
-fn visible(cache: &Cache, cfg: &Config, all: bool) -> Vec<Assignment> {
+fn visible(cache: &Cache, cfg: &Config, paths: &Paths, all: bool) -> Vec<Assignment> {
     let now = Utc::now();
+    let hidden = hidden::Hidden::load(paths);
     cache
         .assignments
         .iter()
-        .filter(|a| all || (!a.status.is_done() && a.is_current(now, cfg.keep_past_days)))
+        .filter(|a| {
+            all || (!hidden.contains(a)
+                && !a.status.is_done()
+                && a.is_current(now, cfg.keep_past_days))
+        })
         .cloned()
         .collect()
 }
@@ -251,7 +321,7 @@ fn truncate(s: &str, width: usize) -> String {
 
 fn list(cfg: &Config, paths: &Paths, all: bool, json: bool, cached: bool) -> Result<()> {
     let cache = load_or_sync(cfg, paths, cached)?;
-    let items = visible(&cache, cfg, all);
+    let items = visible(&cache, cfg, paths, all);
     if json {
         println!("{}", serde_json::to_string_pretty(&items)?);
         return Ok(());
@@ -307,7 +377,7 @@ fn waybar(cfg: &Config, paths: &Paths) -> Result<()> {
         cache = sync::sync(cfg, paths).cache;
     }
     let now = Utc::now();
-    let items = visible(&cache, cfg, false);
+    let items = visible(&cache, cfg, paths, false);
     let week: Vec<&Assignment> = items
         .iter()
         .filter(|a| a.due.is_some_and(|d| d - now < Duration::days(7)))

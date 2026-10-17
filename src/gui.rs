@@ -9,8 +9,10 @@ use eframe::egui::{
 };
 
 use crate::auth;
+use crate::browser_login::{self, Site};
 use crate::canvas::normalize_url;
 use crate::config::{Config, Credentials, DEFAULT_CANVAS_URL, Paths};
+use crate::hidden::{self, Hidden};
 use crate::model::{self, Assignment, Filter, Source, Status, Urgency};
 use crate::sync::{self, Cache, Report};
 
@@ -37,7 +39,9 @@ enum Msg {
 }
 
 enum AuthJob {
-    Canvas { url: String, token: String },
+    Browser(Site),
+    CanvasToken { url: String, token: String },
+    CanvasCookies { url: String, cookies: String },
     GradescopePassword { email: String, password: String },
     GradescopeCookies(String),
 }
@@ -46,6 +50,7 @@ enum AuthJob {
 struct AccountsForm {
     canvas_url: String,
     canvas_token: String,
+    canvas_cookies: String,
     gs_email: String,
     gs_password: String,
     gs_cookies: String,
@@ -59,6 +64,9 @@ struct Gui {
     creds: Credentials,
     cache: Cache,
     filter: Filter,
+    hidden: Hidden,
+    /// The last "Hide all overdue", so it can be undone.
+    undo: Option<Vec<String>>,
     syncing: bool,
     errors: Vec<String>,
     accounts_open: bool,
@@ -91,6 +99,8 @@ impl Gui {
         let mut gui = Gui {
             creds: Credentials::load(&paths).unwrap_or_default(),
             cache: Cache::load(&paths),
+            hidden: Hidden::load(&paths),
+            undo: None,
             cfg,
             paths,
             filter: Filter::default(),
@@ -150,6 +160,7 @@ impl Gui {
                 f.message = Some((ok, text));
                 if ok {
                     f.canvas_token.clear();
+                    f.canvas_cookies.clear();
                     f.gs_password.clear();
                     f.gs_cookies.clear();
                     self.creds = Credentials::load(&self.paths).unwrap_or_default();
@@ -185,10 +196,22 @@ impl Gui {
         let (tx, ctx, paths) = (self.tx.clone(), self.ctx.clone(), self.paths.clone());
         std::thread::spawn(move || {
             let (ok, text) = match job {
-                AuthJob::Canvas { url, token } => match auth::login_canvas(&paths, &url, &token) {
-                    Ok(user) => (true, format!("Signed in to Canvas as {user}")),
-                    Err(e) => (false, format!("Canvas: {e:#}")),
+                AuthJob::Browser(site) => match browser_login::sign_in(&site) {
+                    Ok(msg) => (true, msg),
+                    Err(e) => (false, format!("{e:#}")),
                 },
+                AuthJob::CanvasToken { url, token } => {
+                    match auth::login_canvas(&paths, &url, &token) {
+                        Ok(user) => (true, format!("Signed in to Canvas as {user}")),
+                        Err(e) => (false, format!("Canvas: {e:#}")),
+                    }
+                }
+                AuthJob::CanvasCookies { url, cookies } => {
+                    match auth::login_canvas_cookies(&paths, &url, &cookies) {
+                        Ok(user) => (true, format!("Signed in to Canvas as {user}")),
+                        Err(e) => (false, format!("Canvas: {e:#}")),
+                    }
+                }
                 AuthJob::GradescopePassword { email, password } => {
                     match auth::login_gradescope(&paths, &email, &password) {
                         Ok(()) => (true, format!("Signed in to Gradescope as {email}")),
@@ -272,6 +295,11 @@ impl Gui {
             ui.separator();
             ui.checkbox(&mut self.filter.show_done, "Finished");
             ui.checkbox(&mut self.filter.show_past, "Older");
+            if self.hidden.len() > 0 || self.filter.show_hidden {
+                let label = format!("Hidden ({})", self.hidden.len());
+                ui.checkbox(&mut self.filter.show_hidden, label)
+                    .on_hover_text("Show assignments you've hidden");
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let search = ui.add(
                     TextEdit::singleline(&mut self.filter.query)
@@ -316,13 +344,53 @@ impl Gui {
 
     // ---- assignment list ----
 
+    fn save_hidden(&mut self) {
+        if let Err(e) = self.hidden.save(&self.paths) {
+            self.errors.push(format!("saving hidden list: {e:#}"));
+        }
+    }
+
+    fn undo_bar(&mut self, ui: &mut Ui) {
+        let Some(keys) = &self.undo else { return };
+        let (mut undo, mut dismiss) = (false, false);
+        Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(6)
+            .inner_margin(Margin::symmetric(10, 4))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let n = keys.len();
+                    let s = if n == 1 { "" } else { "s" };
+                    ui.label(format!("Hid {n} overdue assignment{s}."));
+                    undo = ui.button("Undo").clicked();
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        dismiss = ui.small_button("×").on_hover_text("Dismiss").clicked();
+                    });
+                });
+            });
+        ui.add_space(6.0);
+        if undo {
+            if let Some(keys) = self.undo.take() {
+                self.hidden.unhide_keys(&keys);
+                self.save_hidden();
+            }
+        } else if dismiss {
+            self.undo = None;
+        }
+    }
+
     fn list(&mut self, ui: &mut Ui) {
         let now = Utc::now();
         let mut items: Vec<&Assignment> = self
             .cache
             .assignments
             .iter()
-            .filter(|a| self.filter.keep(a, now, self.cfg.keep_past_days))
+            .filter(|a| {
+                let hidden = self.hidden.contains(a);
+                self.filter.keep(a, now, self.cfg.keep_past_days, hidden)
+            })
             .collect();
         // Already sorted by due date; a stable sort keeps that within each bucket.
         items.sort_by_key(|a| section_of(a, now).0);
@@ -332,45 +400,88 @@ impl Gui {
             return;
         }
 
-        let mut clicked = None;
+        enum Action {
+            Open(String),
+            Toggle(Assignment),
+            HideOverdue,
+        }
+        let mut action = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 let mut current: Option<String> = None;
                 for a in items {
+                    let is_hidden = self.hidden.contains(a);
                     let (_, title) = section_of(a, now);
                     if current.as_ref() != Some(&title) {
                         ui.add_space(if current.is_none() { 4.0 } else { 12.0 });
-                        let color = if title == "Overdue" {
-                            urgency_color(Urgency::Overdue)
-                        } else {
-                            ui.visuals().strong_text_color()
-                        };
-                        ui.label(RichText::new(&title).strong().size(13.5).color(color));
+                        ui.horizontal(|ui| {
+                            let overdue = title == "Overdue";
+                            let color = if overdue {
+                                urgency_color(Urgency::Overdue)
+                            } else {
+                                ui.visuals().strong_text_color()
+                            };
+                            ui.label(RichText::new(&title).strong().size(13.5).color(color));
+                            if overdue {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let b = ui.small_button("Hide all overdue").on_hover_text(
+                                        "Remove every overdue assignment from the list",
+                                    );
+                                    if b.clicked() {
+                                        action = Some(Action::HideOverdue);
+                                    }
+                                });
+                            }
+                        });
                         current = Some(title);
                     }
-                    let resp = row(ui, a, now);
-                    if resp.clicked() {
-                        clicked = a.url.clone();
+                    let (resp, toggle) = row(ui, a, now, is_hidden);
+                    if toggle {
+                        action = Some(Action::Toggle(a.clone()));
+                    } else if resp.clicked() {
+                        action = a.url.clone().map(Action::Open);
                     }
-                    if let Some(url) = &a.url {
-                        let url = url.clone();
-                        resp.context_menu(|ui| {
+                    resp.context_menu(|ui| {
+                        if let Some(url) = &a.url {
                             if ui.button("Open").clicked() {
-                                clicked = Some(url.clone());
+                                action = Some(Action::Open(url.clone()));
                                 ui.close();
                             }
                             if ui.button("Copy link").clicked() {
                                 ui.ctx().copy_text(url.clone());
                                 ui.close();
                             }
-                        });
-                    }
+                        }
+                        let label = if is_hidden { "Unhide" } else { "Hide" };
+                        if ui.button(label).clicked() {
+                            action = Some(Action::Toggle(a.clone()));
+                            ui.close();
+                        }
+                    });
                 }
                 ui.add_space(12.0);
             });
-        if let Some(url) = clicked {
-            self.open(&url);
+        match action {
+            Some(Action::Open(url)) => self.open(&url),
+            Some(Action::Toggle(a)) => {
+                self.hidden.toggle(&a);
+                self.undo = None;
+                self.save_hidden();
+            }
+            Some(Action::HideOverdue) => {
+                let keys: Vec<String> = self
+                    .cache
+                    .assignments
+                    .iter()
+                    .filter(|a| a.urgency(now) == Urgency::Overdue && !self.hidden.contains(a))
+                    .map(hidden::key)
+                    .collect();
+                self.hidden.hide_keys(keys.clone());
+                self.undo = Some(keys);
+                self.save_hidden();
+            }
+            None => {}
         }
     }
 
@@ -405,7 +516,16 @@ impl Gui {
         let modal = egui::Modal::new(Id::unique("accounts")).show(ctx, |ui| {
             ui.set_width(460.0);
             let f = &mut self.form;
+            let idle = !f.busy;
             ui.heading("Accounts");
+            ui.label(
+                RichText::new(
+                    "“Sign in with browser” opens a window where you log in like on the \
+                     website (WashU SSO and Duo work). dew only keeps the session cookie.",
+                )
+                .small()
+                .weak(),
+            );
             ui.add_space(8.0);
 
             // Canvas
@@ -417,55 +537,65 @@ impl Gui {
                     .as_ref()
                     .map(|c| format!("{} · {}", c.user, c.url.trim_start_matches("https://"))),
             );
-            egui::Grid::new("canvas")
-                .num_columns(2)
-                .min_col_width(96.0)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("URL");
-                    ui.add(TextEdit::singleline(&mut f.canvas_url).desired_width(320.0));
-                    ui.end_row();
-                    ui.label("Access token");
-                    let token = ui.add(
-                        TextEdit::singleline(&mut f.canvas_token)
-                            .password(true)
-                            .hint_text("paste a new access token")
-                            .desired_width(320.0),
-                    );
-                    if token.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        job = Some(AuthJob::Canvas {
-                            url: f.canvas_url.clone(),
-                            token: f.canvas_token.clone(),
-                        });
-                    }
-                    ui.end_row();
-                });
             ui.horizontal(|ui| {
-                let settings = format!("{}/profile/settings", normalize_url(&f.canvas_url));
-                if ui.link("Create a token").on_hover_text(&settings).clicked() {
-                    let _ = crate::open_url(&self.cfg.opener, &settings);
-                }
+                ui.label("URL");
+                ui.add(TextEdit::singleline(&mut f.canvas_url).desired_width(220.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let ready = !f.busy && !f.canvas_token.trim().is_empty();
-                    if ui
-                        .add_enabled(ready, egui::Button::new("Sign in"))
-                        .clicked()
-                    {
-                        job = Some(AuthJob::Canvas {
-                            url: f.canvas_url.clone(),
-                            token: f.canvas_token.clone(),
-                        });
-                    }
                     if self.creds.canvas.is_some() && ui.button("Sign out").clicked() {
                         sign_out = Some(Source::Canvas);
                     }
+                    let browser = egui::Button::new(RichText::new("Sign in with browser").strong());
+                    if ui.add_enabled(idle, browser).clicked() {
+                        job = Some(AuthJob::Browser(Site::Canvas {
+                            url: f.canvas_url.clone(),
+                        }));
+                    }
                 });
             });
-            ui.label(
-                RichText::new("In Canvas: Account > Settings > “+ New Access Token”.")
-                    .small()
-                    .weak(),
-            );
+            egui::CollapsingHeader::new("Other ways to sign in")
+                .id_salt("canvas-other")
+                .show(ui, |ui| {
+                    let settings = format!("{}/profile/settings", normalize_url(&f.canvas_url));
+                    if secret_row(
+                        ui,
+                        "Access token",
+                        &mut f.canvas_token,
+                        "paste a token",
+                        idle,
+                    ) {
+                        job = Some(AuthJob::CanvasToken {
+                            url: f.canvas_url.clone(),
+                            token: f.canvas_token.clone(),
+                        });
+                    }
+                    if ui
+                        .link("Create a token (if your school allows it)")
+                        .on_hover_text(&settings)
+                        .clicked()
+                    {
+                        let _ = crate::open_url(&self.cfg.opener, &settings);
+                    }
+                    if secret_row(
+                        ui,
+                        "Cookies",
+                        &mut f.canvas_cookies,
+                        "canvas_session=…",
+                        idle,
+                    ) {
+                        job = Some(AuthJob::CanvasCookies {
+                            url: f.canvas_url.clone(),
+                            cookies: f.canvas_cookies.clone(),
+                        });
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Cookies: copy canvas_session from a signed-in browser \
+                             (DevTools > Storage or Application > Cookies).",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
 
             ui.add_space(6.0);
             ui.separator();
@@ -477,70 +607,38 @@ impl Gui {
                 "Gradescope",
                 self.creds.gradescope.as_ref().map(|g| g.email.clone()),
             );
-            egui::Grid::new("gradescope")
-                .num_columns(2)
-                .min_col_width(96.0)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Email");
-                    ui.add(TextEdit::singleline(&mut f.gs_email).desired_width(320.0));
-                    ui.end_row();
-                    ui.label("Password");
-                    let pw = ui.add(
-                        TextEdit::singleline(&mut f.gs_password)
-                            .password(true)
-                            .desired_width(320.0),
-                    );
-                    if pw.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        job = Some(AuthJob::GradescopePassword {
-                            email: f.gs_email.clone(),
-                            password: f.gs_password.clone(),
-                        });
-                    }
-                    ui.end_row();
-                });
             ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Pick “School Credentials” for WashU SSO.")
+                        .small()
+                        .weak(),
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let ready =
-                        !f.busy && !f.gs_email.trim().is_empty() && !f.gs_password.is_empty();
-                    if ui
-                        .add_enabled(ready, egui::Button::new("Sign in"))
-                        .clicked()
-                    {
-                        job = Some(AuthJob::GradescopePassword {
-                            email: f.gs_email.clone(),
-                            password: f.gs_password.clone(),
-                        });
-                    }
                     if self.creds.gradescope.is_some() && ui.button("Sign out").clicked() {
                         sign_out = Some(Source::Gradescope);
                     }
+                    let browser = egui::Button::new(RichText::new("Sign in with browser").strong());
+                    if ui.add_enabled(idle, browser).clicked() {
+                        job = Some(AuthJob::Browser(Site::Gradescope));
+                    }
                 });
             });
-            egui::CollapsingHeader::new("Use school SSO? Sign in with browser cookies")
-                .id_salt("sso")
+            egui::CollapsingHeader::new("Other ways to sign in")
+                .id_salt("gs-other")
                 .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(
-                            "Either set a Gradescope password with “Forgot your password?” on \
-                             gradescope.com, or copy the signed_token and _gradescope_session \
-                             cookies from a signed-in browser (DevTools > Storage or Application > \
-                             Cookies) and paste them here.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.add(
-                        TextEdit::singleline(&mut f.gs_cookies)
-                            .password(true)
-                            .hint_text("signed_token=…; _gradescope_session=…")
-                            .desired_width(f32::INFINITY),
-                    );
-                    let ready = !f.busy && !f.gs_cookies.trim().is_empty();
-                    if ui
-                        .add_enabled(ready, egui::Button::new("Use cookies"))
-                        .clicked()
-                    {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([96.0, 20.0], egui::Label::new("Email"));
+                        ui.add(TextEdit::singleline(&mut f.gs_email).desired_width(240.0));
+                    });
+                    let has_email = !f.gs_email.trim().is_empty();
+                    if secret_row(ui, "Password", &mut f.gs_password, "", idle && has_email) {
+                        job = Some(AuthJob::GradescopePassword {
+                            email: f.gs_email.clone(),
+                            password: f.gs_password.clone(),
+                        });
+                    }
+                    let hint = "signed_token=…; _gradescope_session=…";
+                    if secret_row(ui, "Cookies", &mut f.gs_cookies, hint, idle) {
                         job = Some(AuthJob::GradescopeCookies(f.gs_cookies.clone()));
                     }
                 });
@@ -550,7 +648,7 @@ impl Gui {
             ui.horizontal(|ui| {
                 if f.busy {
                     ui.add(egui::Spinner::new());
-                    ui.label("Signing in…");
+                    ui.label("Finish signing in in the other window…");
                 } else if let Some((ok, msg)) = &f.message {
                     let color = if *ok {
                         Color32::from_rgb(60, 170, 90)
@@ -578,6 +676,26 @@ impl Gui {
     }
 }
 
+/// A masked input with a "Sign in" button. True when submitted (click or Enter).
+fn secret_row(ui: &mut Ui, label: &str, value: &mut String, hint: &str, enabled: bool) -> bool {
+    ui.horizontal(|ui| {
+        ui.add_sized([96.0, 20.0], egui::Label::new(label));
+        let field = ui.add(
+            TextEdit::singleline(value)
+                .password(true)
+                .hint_text(hint)
+                .desired_width(240.0),
+        );
+        let ready = enabled && !value.trim().is_empty();
+        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        let clicked = ui
+            .add_enabled(ready, egui::Button::new("Sign in"))
+            .clicked();
+        ready && (clicked || enter)
+    })
+    .inner
+}
+
 impl eframe::App for Gui {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         while let Ok(msg) = self.rx.try_recv() {
@@ -601,6 +719,7 @@ impl eframe::App for Gui {
                     self.error_banner(ui);
                     ui.add_space(6.0);
                 }
+                self.undo_bar(ui);
                 self.list(ui);
             });
         if self.accounts_open {
@@ -701,9 +820,11 @@ fn due_text(a: &Assignment, now: DateTime<Utc>) -> (String, String) {
     (rel, abs)
 }
 
-/// One clickable assignment card.
-fn row(ui: &mut Ui, a: &Assignment, now: DateTime<Utc>) -> Response {
+/// One clickable assignment card. The bool is true when its Hide/Restore
+/// button was clicked.
+fn row(ui: &mut Ui, a: &Assignment, now: DateTime<Utc>, is_hidden: bool) -> (Response, bool) {
     const HEIGHT: f32 = 40.0;
+    let mut toggle = false;
     let urgency = a.urgency(now);
     let accent = urgency_color(urgency);
     let done = a.status.is_done();
@@ -713,7 +834,10 @@ fn row(ui: &mut Ui, a: &Assignment, now: DateTime<Utc>) -> Response {
         .sense(Sense::click());
     let resp = ui
         .scope_builder(builder, |ui| {
-            let hovered = ui.response().hovered();
+            if is_hidden {
+                ui.multiply_opacity(0.55);
+            }
+            let hovered = ui.response().hovered() || ui.response().contains_pointer();
             let fill = if hovered {
                 ui.visuals().widgets.hovered.weak_bg_fill
             } else {
@@ -750,6 +874,23 @@ fn row(ui: &mut Ui, a: &Assignment, now: DateTime<Utc>) -> Response {
                             |ui| {
                                 ui.set_min_width(130.0);
                                 status_chip(ui, &a.status);
+                            },
+                        );
+                        // Only shown on hover (always for hidden items), but the
+                        // space is kept so names don't shift around.
+                        ui.allocate_ui_with_layout(
+                            vec2(70.0, HEIGHT),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                ui.set_min_width(70.0);
+                                if hovered || is_hidden {
+                                    let (label, tip) = if is_hidden {
+                                        ("Restore", "Put this back in the list")
+                                    } else {
+                                        ("Hide", "Remove this from the list")
+                                    };
+                                    toggle = ui.small_button(label).on_hover_text(tip).clicked();
+                                }
                             },
                         );
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
@@ -796,8 +937,9 @@ fn row(ui: &mut Ui, a: &Assignment, now: DateTime<Utc>) -> Response {
     } else {
         resp
     };
-    match &a.url {
+    let resp = match &a.url {
         Some(url) => resp.on_hover_text_at_pointer(format!("Open {url}")),
         None => resp,
-    }
+    };
+    (resp, toggle)
 }

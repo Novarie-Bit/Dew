@@ -14,7 +14,11 @@ pub struct Paths {
     pub config: PathBuf,
     pub credentials: PathBuf,
     pub gradescope_cookies: PathBuf,
+    pub canvas_cookies: PathBuf,
+    /// Browser profile for the sign-in window (keeps SSO / Duo "remember me").
+    pub webview_data: PathBuf,
     pub cache: PathBuf,
+    pub hidden: PathBuf,
 }
 
 impl Paths {
@@ -25,7 +29,10 @@ impl Paths {
             config: dirs.config_dir().join("config.toml"),
             credentials: dirs.config_dir().join("credentials.toml"),
             gradescope_cookies: dirs.data_dir().join("gradescope_cookies.json"),
+            canvas_cookies: dirs.data_dir().join("canvas_cookies.json"),
+            webview_data: dirs.data_dir().join("webview"),
             cache: dirs.cache_dir().join("assignments.json"),
+            hidden: dirs.data_dir().join("hidden.json"),
         })
     }
 }
@@ -80,6 +87,8 @@ impl Config {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CanvasCreds {
     pub url: String,
+    /// Empty when signed in through the browser (session cookies).
+    #[serde(default)]
     pub token: String,
     /// Display name reported by Canvas when the token was verified.
     #[serde(default)]

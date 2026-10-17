@@ -6,10 +6,12 @@ pkgdesc="Assignment tracker for Canvas and Gradescope (desktop app + TUI)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/novarie-bit/dew"
 license=('custom')
-# The GUI loads these at runtime (Wayland or X11, plus OpenGL).
+# The GUI loads these at runtime (Wayland or X11, plus OpenGL); the sign-in
+# window is WebKitGTK.
 depends=('gcc-libs' 'glibc' 'libglvnd' 'libxkbcommon' 'libxkbcommon-x11'
-         'wayland' 'libx11' 'libxcursor' 'libxrandr' 'libxi')
-makedepends=('cargo' 'cmake')
+         'wayland' 'libx11' 'libxcursor' 'libxrandr' 'libxi'
+         'webkit2gtk-4.1' 'gtk3')
+makedepends=('cargo' 'cmake' 'pkgconf')
 optdepends=('xdg-utils: open assignments in the browser'
             'waybar: status bar module')
 options=('!lto')

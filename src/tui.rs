@@ -16,6 +16,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::auth;
 use crate::config::{Config, Credentials, DEFAULT_CANVAS_URL, Paths};
+use crate::hidden::{self, Hidden};
 use crate::model::{self, Assignment, Filter, Source, Status, Urgency};
 use crate::sync::{self, Cache, Report};
 
@@ -57,6 +58,7 @@ struct App {
     paths: Paths,
     creds: Credentials,
     cache: Cache,
+    hidden: Hidden,
     view: Vec<usize>,
     table: TableState,
     filter: Filter,
@@ -84,6 +86,7 @@ impl App {
     fn new(cfg: Config, paths: Paths) -> App {
         let creds = Credentials::load(&paths).unwrap_or_default();
         let cache = Cache::load(&paths);
+        let hidden = Hidden::load(&paths);
         let (tx, rx) = channel();
         let form = LoginForm {
             fields: Default::default(),
@@ -99,6 +102,7 @@ impl App {
             view: Vec::new(),
             table: TableState::default(),
             filter: Filter::default(),
+            hidden,
             mode: Mode::List,
             form,
             syncing: false,
@@ -205,7 +209,10 @@ impl App {
             .assignments
             .iter()
             .enumerate()
-            .filter(|(_, a)| self.filter.keep(a, now, self.cfg.keep_past_days))
+            .filter(|(_, a)| {
+                let hidden = self.hidden.contains(a);
+                self.filter.keep(a, now, self.cfg.keep_past_days, hidden)
+            })
             .map(|(i, _)| i)
             .collect();
         let pos = selected_id
@@ -231,6 +238,13 @@ impl App {
         let cur = self.table.selected().unwrap_or(0) as isize;
         let next = (cur + delta).clamp(0, self.view.len() as isize - 1);
         self.table.select(Some(next as usize));
+    }
+
+    fn save_hidden(&mut self) {
+        if let Err(e) = self.hidden.save(&self.paths) {
+            self.errors.push(format!("saving hidden list: {e:#}"));
+        }
+        self.rebuild_view();
     }
 
     fn open_selected(&mut self) {
@@ -381,6 +395,34 @@ impl App {
                 self.filter.show_past = !self.filter.show_past;
                 self.rebuild_view();
             }
+            KeyCode::Char('h') => {
+                self.filter.show_hidden = !self.filter.show_hidden;
+                self.rebuild_view();
+            }
+            KeyCode::Char('x') => {
+                if let Some(a) = self.selected().cloned() {
+                    let now_hidden = self.hidden.toggle(&a);
+                    self.flash = Some(if now_hidden {
+                        format!("Hid “{}” (h shows hidden, x again restores)", a.name)
+                    } else {
+                        format!("Restored “{}”", a.name)
+                    });
+                    self.save_hidden();
+                }
+            }
+            KeyCode::Char('X') => {
+                let now = Utc::now();
+                let keys: Vec<String> = self
+                    .cache
+                    .assignments
+                    .iter()
+                    .filter(|a| a.urgency(now) == Urgency::Overdue && !self.hidden.contains(a))
+                    .map(hidden::key)
+                    .collect();
+                self.flash = Some(format!("Hid {} overdue (h shows them)", keys.len()));
+                self.hidden.hide_keys(keys);
+                self.save_hidden();
+            }
             KeyCode::Char('s') | KeyCode::Tab => {
                 self.filter.source = match self.filter.source {
                     None => Some(Source::Canvas),
@@ -410,6 +452,25 @@ impl App {
                 f.fields[f.focus].pop();
             }
             KeyCode::Char('u') if ctrl => f.fields[f.focus].clear(),
+            KeyCode::Char('b') if ctrl => {
+                let site = if f.focus <= TOKEN {
+                    crate::browser_login::Site::Canvas {
+                        url: f.fields[URL].clone(),
+                    }
+                } else {
+                    crate::browser_login::Site::Gradescope
+                };
+                f.busy = true;
+                f.message = Some((true, "Finish signing in in the window that opened…".into()));
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let (ok, text) = match crate::browser_login::sign_in(&site) {
+                        Ok(msg) => (true, msg),
+                        Err(e) => (false, format!("{e:#}")),
+                    };
+                    let _ = tx.send(Msg::LoggedIn { ok, text });
+                });
+            }
             KeyCode::Char('x') if ctrl => {
                 let canvas = f.focus <= TOKEN;
                 let r = if canvas {
@@ -484,6 +545,15 @@ impl App {
                 "-past"
             },
         ));
+        if self.hidden.len() > 0 || self.filter.show_hidden {
+            let n = self.hidden.len();
+            let label = if self.filter.show_hidden {
+                format!("+hidden {n}")
+            } else {
+                format!("-hidden {n}")
+            };
+            spans.push(tag(self.filter.show_hidden, &label));
+        }
         if !self.filter.query.is_empty() || self.mode == Mode::Search {
             spans.push(format!("/{}", self.filter.query).yellow());
             if self.mode == Mode::Search {
@@ -556,13 +626,21 @@ impl App {
                 Source::Canvas => a.source.short().red(),
                 Source::Gradescope => a.source.short().cyan(),
             };
+            let (status, style) = if self.hidden.contains(a) {
+                (
+                    "Hidden".to_string(),
+                    style.add_modifier(Modifier::DIM | Modifier::ITALIC),
+                )
+            } else {
+                (a.status.label(), style)
+            };
             Row::new(vec![
                 Cell::from(due),
                 Cell::from(Line::from(left).right_aligned()),
                 Cell::from(src),
                 Cell::from(a.course.clone()),
                 Cell::from(a.name.clone()),
-                Cell::from(a.status.label()).style(status_style),
+                Cell::from(status).style(status_style),
             ])
             .style(style)
         });
@@ -645,6 +723,7 @@ impl App {
                 ("r", "refresh"),
                 ("d", "done"),
                 ("p", "past"),
+                ("x", "hide"),
                 ("s", "source"),
                 ("/", "search"),
                 ("L", "accounts"),
@@ -664,11 +743,13 @@ impl App {
     fn draw_login(&self, f: &mut Frame) {
         let area = f
             .area()
-            .centered(Constraint::Max(76), Constraint::Length(22));
+            .centered(Constraint::Max(80), Constraint::Length(22));
         f.render_widget(Clear, area);
         let block = Block::bordered().title(" accounts ").title_bottom(
-            Line::from(" Enter sign in · Tab next · Ctrl-U clear · Ctrl-X sign out · Esc close ")
-                .centered(),
+            Line::from(
+                " Ctrl-B browser sign-in · Enter submit · Tab next · Ctrl-X sign out · Esc close ",
+            )
+            .centered(),
         );
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -710,15 +791,13 @@ impl App {
             }
             lines.push(Line::from(spans));
             if i == TOKEN {
-                let hint = format!(
-                    "   create one at {}/profile/settings → New Access Token",
-                    crate::canvas::normalize_url(&self.form.fields[URL])
-                );
-                lines.push(Line::from(hint.dark_gray()));
+                lines.push(Line::from(
+                    "   Ctrl-B here: sign in with a browser window (WashU SSO + Duo)".cyan(),
+                ));
             }
         }
         lines.push(Line::from(
-            "   SSO account? Set a password via Gradescope's \"Forgot password\",".dark_gray(),
+            "   Ctrl-B here: sign in with a browser window (\"School Credentials\")".cyan(),
         ));
         lines.push(Line::from(
             "   or paste browser cookies: signed_token=…; _gradescope_session=…".dark_gray(),
@@ -740,7 +819,7 @@ impl App {
 fn draw_help(f: &mut Frame) {
     let area = f
         .area()
-        .centered(Constraint::Max(60), Constraint::Length(20));
+        .centered(Constraint::Max(62), Constraint::Length(23));
     f.render_widget(Clear, area);
     let rows = [
         ("j / k, ↑ / ↓", "move"),
@@ -750,6 +829,9 @@ fn draw_help(f: &mut Frame) {
         ("r", "refresh now"),
         ("d", "show / hide finished work"),
         ("p", "show / hide long-past items"),
+        ("x", "hide (remove) / restore selected"),
+        ("X", "hide every overdue item"),
+        ("h", "show / hide hidden items"),
         ("s, Tab", "cycle Canvas / Gradescope / all"),
         ("/", "search (Esc clears)"),
         ("L", "accounts: sign in / out"),

@@ -42,7 +42,7 @@ pub fn sync(cfg: &Config, paths: &Paths) -> Report {
     let (canvas, gradescope) = std::thread::scope(|s| {
         let canvas = s.spawn(|| -> Option<Result<Vec<Assignment>>> {
             let c = creds.canvas.as_ref()?;
-            Some(Canvas::new(&c.url, &c.token).and_then(|c| c.fetch_all()))
+            Some(Canvas::from_creds(c, paths).and_then(|c| c.fetch_all()))
         });
         let gradescope = s.spawn(|| -> Option<Result<Vec<Assignment>>> {
             let gs = match Gradescope::load(&paths.gradescope_cookies) {
@@ -82,6 +82,12 @@ pub fn sync(cfg: &Config, paths: &Paths) -> Report {
         items = model::dedupe(items);
     }
     model::sort(&mut items);
+    let mut hidden = crate::hidden::Hidden::load(paths);
+    let before = hidden.len();
+    hidden.retain_existing(&items);
+    if hidden.len() != before {
+        let _ = hidden.save(paths);
+    }
 
     let cache = Cache {
         fetched_at: Some(Utc::now()),

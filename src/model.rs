@@ -129,13 +129,21 @@ impl Assignment {
 pub struct Filter {
     pub show_done: bool,
     pub show_past: bool,
+    pub show_hidden: bool,
     pub source: Option<Source>,
     pub query: String,
 }
 
 impl Filter {
-    pub fn keep(&self, a: &Assignment, now: DateTime<Utc>, keep_past_days: i64) -> bool {
-        (self.show_done || !a.status.is_done())
+    pub fn keep(
+        &self,
+        a: &Assignment,
+        now: DateTime<Utc>,
+        keep_past_days: i64,
+        hidden: bool,
+    ) -> bool {
+        (self.show_hidden || !hidden)
+            && (self.show_done || !a.status.is_done())
             && (self.show_past || a.is_current(now, keep_past_days))
             && self.source.is_none_or(|s| s == a.source)
             && a.matches(&self.query)
