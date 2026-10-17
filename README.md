@@ -17,10 +17,14 @@ to open it in your browser.
 ## Install (Arch / CachyOS)
 
 ```sh
-sudo pacman -S --needed rust cmake
+sudo pacman -S --needed cmake
 git clone https://github.com/novarie-bit/dew && cd dew/packaging/arch
 makepkg -si
 ```
+
+You also need Rust. If `cargo --version` doesn't work yet, install **either**
+`rustup` (then run `rustup toolchain install stable`) **or** the `rust` package. Don't
+install both, because they conflict. If pacman offers to remove `rustup`, say no.
 
 Or without packaging it: `cargo install --path .` (puts `dew` in `~/.cargo/bin`).
 
