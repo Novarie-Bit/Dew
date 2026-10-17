@@ -2,7 +2,7 @@
 name = "dew"
 version = "0.1.0"
 edition = "2024"
-description = "Terminal assignment tracker for Canvas and Gradescope"
+description = "Assignment tracker for Canvas and Gradescope"
 repository = "https://github.com/novarie-bit/dew"
 
 [dependencies]
@@ -11,6 +11,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
 cookie_store = "0.22.1"
 directories = "6.0.0"
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11", "clipboard", "links"] }
 ratatui = "0.30.2"
 reqwest = { version = "0.13.5", features = ["blocking", "json", "cookies", "gzip", "form", "query"] }
 reqwest_cookie_store = "0.10.0"

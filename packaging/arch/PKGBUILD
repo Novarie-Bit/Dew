@@ -2,11 +2,13 @@
 pkgname=dew
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Terminal assignment tracker for Canvas and Gradescope"
+pkgdesc="Assignment tracker for Canvas and Gradescope (desktop app + TUI)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/novarie-bit/dew"
 license=('custom')
-depends=('gcc-libs' 'glibc')
+# The GUI loads these at runtime (Wayland or X11, plus OpenGL).
+depends=('gcc-libs' 'glibc' 'libglvnd' 'libxkbcommon' 'libxkbcommon-x11'
+         'wayland' 'libx11' 'libxcursor' 'libxrandr' 'libxi')
 makedepends=('cargo' 'cmake')
 optdepends=('xdg-utils: open assignments in the browser'
             'waybar: status bar module')

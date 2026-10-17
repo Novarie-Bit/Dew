@@ -95,7 +95,7 @@ impl Gradescope {
             .http
             .get(format!("{BASE}{path}"))
             .send()
-            .with_context(|| format!("requesting Gradescope {path}"))?;
+            .map_err(|e| crate::network_error(e, BASE))?;
         if !resp.status().is_success() {
             bail!("Gradescope returned {} for {path}", resp.status());
         }

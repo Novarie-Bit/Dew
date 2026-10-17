@@ -2,6 +2,7 @@ mod auth;
 mod canvas;
 mod config;
 mod gradescope;
+mod gui;
 mod model;
 mod sync;
 mod tui;
@@ -26,7 +27,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Open the interactive view (the default).
+    /// Open the window (the default when a display is available).
+    Gui,
+    /// Open the terminal view (the default without a display).
     Tui,
     /// Fetch everything and print what's due.
     List {
@@ -70,7 +73,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::new()?;
     let cfg = Config::load(&paths)?;
-    match cli.command.unwrap_or(Command::Tui) {
+    let has_display = ["WAYLAND_DISPLAY", "DISPLAY"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some_and(|x| !x.is_empty()));
+    let default = if has_display {
+        Command::Gui
+    } else {
+        Command::Tui
+    };
+    match cli.command.unwrap_or(default) {
+        Command::Gui => gui::run(cfg, paths),
         Command::Tui => tui::run(cfg, paths),
         Command::List { all, json, cached } => list(&cfg, &paths, all, json, cached),
         Command::Sync => {
@@ -99,6 +111,32 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Status => status(&paths),
+    }
+}
+
+/// Opens `url` with the configured opener (xdg-open by default), detached.
+pub fn open_url(opener: &str, url: &str) -> io::Result<()> {
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        // Reap the child so a long-running GUI doesn't collect zombies.
+        .map(|mut child| drop(std::thread::spawn(move || child.wait())))
+}
+
+/// Turns connection failures into a short message; other errors keep their detail.
+pub fn network_error(e: reqwest::Error, site: &str) -> anyhow::Error {
+    let host = site
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    if e.is_connect() {
+        anyhow::anyhow!("couldn't connect to {host} (offline?)")
+    } else if e.is_timeout() {
+        anyhow::anyhow!("{host} took too long to respond")
+    } else {
+        anyhow::Error::new(e).context(format!("requesting {host}"))
     }
 }
 

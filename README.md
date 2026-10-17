@@ -1,26 +1,18 @@
 # dew
 
-Canvas and Gradescope assignments in one terminal list, sorted by due date.
+Canvas and Gradescope assignments in one list, sorted by due date. Click an assignment
+to open it in your browser.
 
-```
- dew  [all sources] [-done] [-past]                                         synced 2m ago
-┌ 6 of 9 ─────────────────────────────────────────────────────────────────────────────────┐
-│ Due              Left       Course        Assignment                       Status       │
-│▌Fri Oct 16 23:59  -1d 6h CV Writing 1     Reading Response 7               Missing      │
-│ Sat Oct 17 23:59  4h 59m GS CSE 247       Lab 5: Heaps                     To do        │
-│ Sun Oct 18 23:59 19h 58m CV CSE 247       Problem Set 5                    To do        │
-│ Mon Oct 19 23:59  2d 12h GS CSE 247       Homework 3                       To do        │
-│ Fri Oct 23 23:59  5d 23h CV Writing 1     Midterm Essay                    To do        │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-```
+![dew window](docs/screenshot.png)
 
 - Pulls from **Canvas** (official REST API) and **Gradescope** (scrapes the web pages,
   since there's no public API)
+- Groups work by day (Overdue, Today, Tomorrow, …) and colors it by how soon it's due
 - Hides finished work and items more than 14 days past due by default
 - Drops Canvas copies of assignments that are really submitted on Gradescope
-- Search, filter by source, open the selected item in your browser
 - Keeps the last fetch on disk, so it opens instantly and still works offline
-- `dew list` for plain output, `dew waybar` for a status bar module
+- Also has a terminal view (`dew tui`), plain output (`dew list`), and a Waybar module
+  (`dew waybar`)
 
 ## Install (Arch / CachyOS)
 
@@ -34,7 +26,8 @@ Or without packaging it: `cargo install --path .` (puts `dew` in `~/.cargo/bin`)
 
 ## Sign in
 
-Run `dew` and press `L` (the accounts screen also opens on first launch), or use the CLI.
+Open dew and click **Accounts** (it opens by itself on first launch). In the terminal view
+the same screen is on `L`, or you can use `dew login`.
 
 ### Canvas
 
@@ -62,7 +55,18 @@ There are two options:
 dew never saves your Gradescope password, only the session cookie (with "remember me"
 on). When that expires, dew asks you to sign in again.
 
-## Keys
+## Using it
+
+In the window:
+
+- **Click** an assignment to open it on Canvas/Gradescope. Right-click to copy the link.
+- **All / Canvas / Gradescope** filter by source. **Finished** and **Older** show
+  submitted work and items more than `keep_past_days` past due.
+- **Ctrl+F** searches names and courses; **F5** or **Refresh** re-syncs.
+- A colored bar on each card shows urgency: red is overdue, orange is due within 24h,
+  yellow within 3 days, blue later, green finished.
+
+Terminal view (`dew tui`) keys:
 
 | key | action |
 | --- | --- |
@@ -80,10 +84,14 @@ on). When that expires, dew asks you to sign in again.
 
 Rows are red when overdue, bold red when due within 24h, and yellow when due within 3 days.
 
+`dew` with no arguments opens the window when there's a display (`WAYLAND_DISPLAY` or
+`DISPLAY`), and the terminal view otherwise, e.g. over SSH.
+
 ## CLI
 
 ```
-dew                 interactive view
+dew                 window (or terminal view without a display)
+dew gui | dew tui   pick one explicitly
 dew list [-a] [--json] [--cached]
 dew sync
 dew waybar
@@ -100,7 +108,7 @@ dew status          sign-in state and file locations
   "return-type": "json",
   "interval": 300,
   "format": "󰃭 {}",
-  "on-click": "kitty -e dew"
+  "on-click": "dew gui"
 }
 ```
 
@@ -123,8 +131,9 @@ cache is older than `refresh_minutes`.
 keep_past_days = 14          # keep showing items this many days after they were due
 dedupe = true                # hide Canvas mirrors of Gradescope assignments
 gradescope_all_terms = false # only the newest Gradescope term by default
-refresh_minutes = 30         # auto-refresh interval (TUI and waybar)
-opener = "xdg-open"
+refresh_minutes = 30         # auto-refresh interval (window, TUI, waybar)
+opener = "xdg-open"          # command used to open links
+theme = "system"             # window theme: "system", "light", or "dark"
 ```
 
 ## Notes
@@ -132,5 +141,7 @@ opener = "xdg-open"
 - The Gradescope scraper depends on Gradescope's page markup. If they change it,
   assignments might come back empty or with missing dates. The parser lives in
   `src/gradescope.rs`, with HTML fixtures in `tests/fixtures/`.
+- The window uses egui with OpenGL and runs natively on Wayland (KDE, Hyprland, Sway, …)
+  and X11. If it can't open a window, it says so; `dew tui` still works.
 - If your school has turned off Canvas access tokens, `dew login canvas` will fail with a
   401.

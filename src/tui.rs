@@ -1,4 +1,3 @@
-use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration as StdDuration;
 
@@ -17,7 +16,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::auth;
 use crate::config::{Config, Credentials, DEFAULT_CANVAS_URL, Paths};
-use crate::model::{self, Assignment, Source, Status, Urgency};
+use crate::model::{self, Assignment, Filter, Source, Status, Urgency};
 use crate::sync::{self, Cache, Report};
 
 enum Msg {
@@ -60,10 +59,7 @@ struct App {
     cache: Cache,
     view: Vec<usize>,
     table: TableState,
-    show_done: bool,
-    show_past: bool,
-    source: Option<Source>,
-    query: String,
+    filter: Filter,
     mode: Mode,
     form: LoginForm,
     syncing: bool,
@@ -102,10 +98,7 @@ impl App {
             cache,
             view: Vec::new(),
             table: TableState::default(),
-            show_done: false,
-            show_past: false,
-            source: None,
-            query: String::new(),
+            filter: Filter::default(),
             mode: Mode::List,
             form,
             syncing: false,
@@ -142,7 +135,7 @@ impl App {
                         self.form.fields[self.form.focus].push_str(s.trim());
                     }
                     Event::Paste(s) if self.mode == Mode::Search => {
-                        self.query.push_str(&s);
+                        self.filter.query.push_str(&s);
                         self.rebuild_view();
                     }
                     _ => {}
@@ -212,10 +205,7 @@ impl App {
             .assignments
             .iter()
             .enumerate()
-            .filter(|(_, a)| self.show_done || !a.status.is_done())
-            .filter(|(_, a)| self.show_past || a.is_current(now, self.cfg.keep_past_days))
-            .filter(|(_, a)| self.source.is_none_or(|s| s == a.source))
-            .filter(|(_, a)| a.matches(&self.query))
+            .filter(|(_, a)| self.filter.keep(a, now, self.cfg.keep_past_days))
             .map(|(i, _)| i)
             .collect();
         let pos = selected_id
@@ -248,13 +238,7 @@ impl App {
             self.flash = Some("No link for this item".into());
             return;
         };
-        let spawned = Command::new(&self.cfg.opener)
-            .arg(&url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        self.flash = Some(match spawned {
+        self.flash = Some(match crate::open_url(&self.cfg.opener, &url) {
             Ok(_) => format!("Opened {url}"),
             Err(e) => format!("Couldn't run {}: {e}", self.cfg.opener),
         });
@@ -344,21 +328,21 @@ impl App {
             Mode::Help => self.mode = Mode::List,
             Mode::Search => match k.code {
                 KeyCode::Esc => {
-                    self.query.clear();
+                    self.filter.query.clear();
                     self.mode = Mode::List;
                     self.rebuild_view();
                 }
                 KeyCode::Enter => self.mode = Mode::List,
                 KeyCode::Backspace => {
-                    self.query.pop();
+                    self.filter.query.pop();
                     self.rebuild_view();
                 }
                 KeyCode::Char('u') if ctrl => {
-                    self.query.clear();
+                    self.filter.query.clear();
                     self.rebuild_view();
                 }
                 KeyCode::Char(c) if !ctrl => {
-                    self.query.push(c);
+                    self.filter.query.push(c);
                     self.rebuild_view();
                 }
                 _ => {}
@@ -372,8 +356,8 @@ impl App {
         self.flash = None;
         match k.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Esc if !self.query.is_empty() => {
-                self.query.clear();
+            KeyCode::Esc if !self.filter.query.is_empty() => {
+                self.filter.query.clear();
                 self.rebuild_view();
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
@@ -390,15 +374,15 @@ impl App {
                 self.start_sync();
             }
             KeyCode::Char('d') => {
-                self.show_done = !self.show_done;
+                self.filter.show_done = !self.filter.show_done;
                 self.rebuild_view();
             }
             KeyCode::Char('p') => {
-                self.show_past = !self.show_past;
+                self.filter.show_past = !self.filter.show_past;
                 self.rebuild_view();
             }
             KeyCode::Char('s') | KeyCode::Tab => {
-                self.source = match self.source {
+                self.filter.source = match self.filter.source {
                     None => Some(Source::Canvas),
                     Some(Source::Canvas) => Some(Source::Gradescope),
                     Some(Source::Gradescope) => None,
@@ -480,17 +464,28 @@ impl App {
             let s = format!("[{label}] ");
             if on { s.cyan() } else { s.dark_gray() }
         };
-        spans.push(tag(true, self.source.map_or("all sources", |s| s.label())));
         spans.push(tag(
-            self.show_done,
-            if self.show_done { "+done" } else { "-done" },
+            true,
+            self.filter.source.map_or("all sources", |s| s.label()),
         ));
         spans.push(tag(
-            self.show_past,
-            if self.show_past { "+past" } else { "-past" },
+            self.filter.show_done,
+            if self.filter.show_done {
+                "+done"
+            } else {
+                "-done"
+            },
         ));
-        if !self.query.is_empty() || self.mode == Mode::Search {
-            spans.push(format!("/{}", self.query).yellow());
+        spans.push(tag(
+            self.filter.show_past,
+            if self.filter.show_past {
+                "+past"
+            } else {
+                "-past"
+            },
+        ));
+        if !self.filter.query.is_empty() || self.mode == Mode::Search {
+            spans.push(format!("/{}", self.filter.query).yellow());
             if self.mode == Mode::Search {
                 spans.push("█".yellow());
             }

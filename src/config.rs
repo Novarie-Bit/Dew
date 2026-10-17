@@ -43,6 +43,8 @@ pub struct Config {
     pub refresh_minutes: i64,
     /// Command used to open links.
     pub opener: String,
+    /// GUI theme: "system", "light" or "dark".
+    pub theme: String,
 }
 
 impl Default for Config {
@@ -53,6 +55,7 @@ impl Default for Config {
             gradescope_all_terms: false,
             refresh_minutes: 30,
             opener: "xdg-open".into(),
+            theme: "system".into(),
         }
     }
 }

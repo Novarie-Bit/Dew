@@ -124,6 +124,24 @@ impl Assignment {
     }
 }
 
+/// The view filters shared by the TUI and GUI.
+#[derive(Clone, Debug, Default)]
+pub struct Filter {
+    pub show_done: bool,
+    pub show_past: bool,
+    pub source: Option<Source>,
+    pub query: String,
+}
+
+impl Filter {
+    pub fn keep(&self, a: &Assignment, now: DateTime<Utc>, keep_past_days: i64) -> bool {
+        (self.show_done || !a.status.is_done())
+            && (self.show_past || a.is_current(now, keep_past_days))
+            && self.source.is_none_or(|s| s == a.source)
+            && a.matches(&self.query)
+    }
+}
+
 /// Sort by due date (undated last), then course, then name.
 pub fn sort(items: &mut [Assignment]) {
     items.sort_by(|a, b| {

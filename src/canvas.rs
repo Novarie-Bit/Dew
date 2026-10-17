@@ -77,11 +77,11 @@ impl Canvas {
             .get(url)
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .send()
-            .with_context(|| format!("requesting {url}"))?;
+            .map_err(|e| crate::network_error(e, &self.base))?;
         match resp.status() {
             s if s.is_success() => Ok(resp),
             StatusCode::UNAUTHORIZED => {
-                bail!("Canvas rejected the access token (401); sign in again")
+                bail!("the access token was rejected (401); create a new one and sign in again")
             }
             s => bail!("Canvas returned {s} for {url}"),
         }
